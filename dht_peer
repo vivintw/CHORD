@@ -1,0 +1,957 @@
+#!/usr/bin/python
+import socket
+import json
+import select
+import os
+from threading import Thread, Lock
+import time
+import hashlib
+import argparse
+import sys
+
+# main cache thats stores the required state for each peer.
+cache = {
+#stores succesor details :
+"succ_ip" : None,
+"succ_port": None,
+"succ_sock" : None,
+"succ_hash" : None,
+#stored predecessor details :
+"pre_ip" : None,
+"pre_sock": None,
+"pre_port" : None,
+"pre_hash" : None,
+# only used by the root peer to store the socket of a new peer temporarily
+"join_sock" : None,
+# value that determines that this peer has the smallest hash.
+"frontEnd" : False,
+#value that determines that this peer has the largest hash.
+"BackEnd" : False
+}
+# needs to be removed ... will have to check first !!!
+my_ip = os.popen("ifconfig | grep inet  | grep broadcast | awk '{print $2}'").read().split("\n")[0].strip()
+
+
+configs = {
+"i_am_root" : True,
+"my_port" : 16500,
+"my_ip" : my_ip,
+"my_ip_hash" : hashlib.sha1(my_ip).digest(),
+"root_port":16500,
+"root_ip": "192.168.1.1",
+"query_interval" : 5,
+}
+
+# global boolean  set to true to stop thread execution.
+kill = False
+# dictionary which is used to store the client id as key and socket as value.
+# used by the root peer to locate the client to return the response in a
+# multiclient  situation.
+client_store = {}
+# global lock to synchronize the use of global cache between threads.
+cache_lock = Lock()
+# maintains a list of all connections that have to be polled by select.
+conn_list = []
+
+
+
+# converts an IP address to bytes.
+def ip_addr_to_bytes(ip_addr):
+    if ip_addr:
+        return bytearray([int(i) for i in ip_addr.split('.')])
+    return bytearray([0]*4)
+
+# converts IP address from bytes to a string
+def bytes_to_ip_addr(data):
+    if any(data):
+        return ".".join([str(i) for i in data])
+    return None
+
+# converts a SHA1 hash string to bytes
+def hash_to_bytes(ip_hash):
+    if ip_hash:
+        return ip_hash
+    return bytearray([0]*20)
+
+#converts a SHA1 hash from bytes to string
+def bytes_to_hash(data):
+    if any(data):
+        return bytes(data)
+    return None
+
+#converts "UPDATE" packets to bytes.
+def gen_update_data(data,arr):
+    arr += ip_addr_to_bytes(data['for'])
+    arr += ip_addr_to_bytes(data['succ_ip'])
+    arr += hash_to_bytes(data['succ_hash'])
+    arr += port_to_bytes(data['succ_port'])
+    arr += ip_addr_to_bytes(data['pre_ip'])
+    arr += hash_to_bytes(data['pre_hash'])
+    arr += port_to_bytes(data['pre_port'])
+    return arr
+
+# converts bytes to dictionary
+def gen_update_dict(data):
+    p = {}
+    p["for"] = bytes_to_ip_addr(data[:4])
+    p['succ_ip'] = bytes_to_ip_addr(data[4:8])
+    p['succ_hash'] = bytes_to_hash(data[8:28])
+    p['succ_port'] = bytes_to_port(data[28:30])
+    p['pre_ip'] = bytes_to_ip_addr(data[30:34])
+    p['pre_hash'] = bytes_to_hash(data[34:54])
+    p['pre_port'] = bytes_to_port(data[54:56])
+    return p
+
+# converts port number to bytes
+def port_to_bytes(port):
+    if port :
+        hex_num = hex(port).split('x')[1]
+        return bytearray([int(hex_num[i]+hex_num[i+1]) for i in range(0,len(hex_num),2)])
+    return bytearray([0]*2)
+
+# converts bytes to port numbers
+def bytes_to_port(data):
+    if(any(data)):
+        return int(str(int(data[0])) + str(int(data[1])),16)
+    return None
+
+# decodes a packet from bytes into dictionary
+def decode_packet_bytes(data):
+
+    types = {
+    1 : "update",
+    2 : "init",
+    3 : "answer",
+    4 : "query",
+    5 : "join",
+    6 : "dead",
+    7 : "data"
+    }
+    operations = {
+    1 : "put",
+    2 : "lookup",
+    3 : "response",
+    4 : "redirect",
+    5 : "close",
+    6 : "get",
+    7 : "move"
+    }
+
+    p = {}
+    arr = bytearray(data)
+    p['type'] = types[arr[0]]
+    if p['type'] == "data":
+        p['client_id'] = bytes_to_hash(arr[1:21])
+        p['operation'] = operations[arr[21]]
+
+        if p['operation'] == "put" or  p['operation'] == "move" :
+            p['obj_name_len'] = arr[22]
+            name_end = 23+arr[22]
+            p['obj_name'] = str(arr[23:name_end])
+            p['obj_key'] = bytes_to_hash(arr[name_end:name_end+20])
+            p['obj_len'] = arr[name_end+20]
+            p['obj'] = str(arr[name_end+21:name_end+21+p['obj_len']])
+
+        elif p['operation'] == "lookup":
+            p['method'] = 'R' if arr[22] == 1 else 'I'
+            p['obj_key'] = bytes_to_hash(arr[23:43])
+
+        elif p['operation'] == "redirect":
+            p['ip'] = bytes_to_ip_addr(arr[22:26])
+            p['port'] = bytes_to_port(arr[26:28])
+
+        elif p['operation'] == "response":
+            p['obj_name_len'] = arr[22]
+            name_end = 23+arr[22]
+            p['obj_name'] = str(arr[23:name_end])
+            p['obj_key'] = bytes_to_hash(arr[name_end:name_end+20])
+            p['obj_len'] = arr[name_end+20]
+            p['obj'] = str(arr[name_end+21:name_end+21+p['obj_len']])
+
+        elif p['operation'] == "get":
+            p['obj_key'] = bytes_to_hash(arr[22:42])
+
+    else:
+        p['ip'] = bytes_to_ip_addr(arr[1:5])
+        p['ip_hash'] = bytes_to_hash(arr[5:25])
+
+        if p['type'] == "update":
+            p['data'] = gen_update_dict(arr[25:])
+
+        elif p['type'] == "init":
+            p['data'] = 'pre_sock' if arr[25] == 1 else 'succ_sock'
+
+        elif p['type'] == "answer":
+            p['data'] = "succ" if arr[25] == 1 else "pre"
+
+        elif p['type'] == "dead":
+            p['data'] = bytes_to_hash(arr[25:45])
+            p['port'] = bytes_to_port(arr[45:47])
+
+        elif p['type'] == "query":
+            p['data'] = "succ" if arr[25] == 1 else "pre"
+
+        elif p['type'] == "join":
+            p['port'] = bytes_to_port(arr[25:27])
+
+    return p
+
+# debug function to print hex value of a packet.
+def print_hex(data):
+    print "".join("%02x " % b for b in data)
+
+#encodes a dictionary into bytes.
+def encode_packet_bytes(packet):
+
+    types = {
+    "update" : 1,
+    "init" : 2,
+    "answer" : 3,
+    "query" : 4,
+    "join" : 5,
+    "dead" : 6,
+    "data": 7
+    }
+
+    operations = {
+    "put": 1,
+    "lookup" : 2,
+    "response" : 3,
+    "redirect" : 4,
+    "close" : 5,
+    "get" : 6,
+    "move": 7
+    }
+    arr = bytearray()
+    arr.append(types[packet['type']])
+    if packet['type'] == "data":
+        arr += hash_to_bytes(packet['client_id'])
+        arr.append(operations[packet['operation']])
+
+        if packet['operation'] == "put" or packet['operation'] == "move":
+            arr.append(packet['obj_name_len'])
+            arr += packet['obj_name']
+            arr += hash_to_bytes(packet['obj_key'])
+            arr.append(packet['obj_len'])
+            arr += packet['obj']
+
+        elif packet['operation'] == "lookup":
+            arr.append(1 if packet['method'] == 'R' else 2)
+            arr += hash_to_bytes(packet['obj_key'])
+
+        elif packet['operation'] == "redirect":
+            arr += ip_addr_to_bytes(packet['ip'])
+            arr += port_to_bytes(packet['port'])
+
+        elif packet['operation'] == "response":
+            arr.append(packet['obj_name_len'])
+            arr += packet['obj_name']
+            arr += hash_to_bytes(packet['obj_key'])
+            arr.append(packet['obj_len'])
+            arr += packet['obj']
+
+        elif packet['operation'] == "get":
+            arr += hash_to_bytes(packet['obj_key'])
+
+
+    else:
+        arr += ip_addr_to_bytes(packet['ip'])
+        arr += hash_to_bytes(packet['ip_hash'])
+
+        if packet['type'] == "update":
+            arr = gen_update_data(packet['data'],arr)
+
+        elif packet['type'] == "init":
+            arr.append(1 if packet['data'] == "pre_sock" else 2)
+
+        elif packet['type'] == "answer":
+            arr.append(1 if packet['data'] == "succ" else 2)
+
+        elif packet['type'] == "dead":
+            arr += hash_to_bytes(packet['data'])
+            arr += port_to_bytes(packet['port'])
+
+        elif packet['type'] == "query":
+            arr.append(1 if packet['data'] == "succ" else 2)
+
+        elif packet['type'] == "join":
+            arr += port_to_bytes(packet['port'])
+
+    return arr
+
+def send_packet(conn,packet):
+    payload = encode_packet_bytes(packet)
+    payload_len = '{:04x}'.format(len(payload)).decode('hex')
+    packet = bytearray(payload_len) + payload
+    conn.send(packet)
+
+def recv_packet(conn):
+    global configs
+    packet_len_byte = conn.recv(2)
+    packet_len = int(str(packet_len_byte).encode('hex'),16)
+    p = conn.recv(packet_len)
+    return decode_packet_bytes(p)
+
+# debug function print "UPDATE" packets
+def print_update(msg):
+    print "="*50
+    print "for",msg['data']['for']
+    print "succ_ip", msg['data']['succ_ip']
+    print "pre_ip",msg['data']['pre_ip']
+    print "="*50
+
+# computes if this peer is either FrontEnd or BackEnd node.
+def compute_end():
+    global configs
+    global cache
+
+    cache['frontEnd'] = cache['pre_hash'] > configs['my_ip_hash']
+    cache['BackEnd'] =  cache['succ_hash'] < configs['my_ip_hash']
+
+# handles a new JOIN request that comes into the network.
+def join_handler(data,conn):
+    global configs
+    global cache_lock
+    global cache
+
+    if configs['i_am_root'] :
+        cache['join_sock'] = conn
+
+    p = {
+      "type": "update",
+      "ip": configs['my_ip'],
+      "ip_hash":configs['my_ip_hash'],
+      "data" : {
+       "for" : data['ip'],
+        "succ_ip" :configs['my_ip'],
+        "succ_hash" :configs['my_ip_hash'],
+        "succ_port" : configs['my_port'],
+        "pre_ip" : configs['my_ip'],
+        "pre_hash" : configs['my_ip_hash'],
+        "pre_port" : configs['my_port']
+        }
+    }
+
+    # i am the root node first connection to me
+    if not (cache['succ_sock'] and cache['pre_sock']):
+
+        p['data']['for'] = data['ip']
+        p['data']['succ_ip'] = configs['my_ip']
+        p['data']['succ_hash'] = configs['my_ip_hash']
+        p['data']['succ_port'] = configs['my_port']
+        p['data']['pre_ip'] = configs['my_ip']
+        p['data']['pre_hash'] =  configs['my_ip_hash']
+        p['data']['pre_port'] = configs['my_port']
+        with cache_lock:
+            cache['succ_ip'] = data['ip']
+            cache['succ_hash'] = data['ip_hash']
+            cache['succ_port'] = data['port']
+            cache['pre_ip'] = data['ip']
+            cache['pre_hash'] = data['ip_hash']
+            cache['pre_port'] = data['port']
+        send_packet(conn,p)
+        close_peer_socket(cache['join_sock'])
+
+    elif configs['my_ip_hash'] < data['ip_hash'] < cache['succ_hash'] :
+        p['data']['for'] = data['ip']
+        p['data']['succ_ip'] = cache['succ_ip']
+        p['data']['succ_hash'] = cache['succ_hash']
+        p['data']['succ_port'] = cache['succ_port']
+        p['data']['pre_ip'] = configs['my_ip']
+        p['data']['pre_hash'] =  configs['my_ip_hash']
+        p['data']['pre_port'] = configs['my_port']
+        if configs['i_am_root']:
+            send_packet(cache['join_sock'],p)
+            close_peer_socket(cache['join_sock'])
+        else :
+            send_packet(cache['pre_sock'],p)
+        p['data']['for'] = cache['succ_ip']
+        p['data']['succ_ip'] = None
+        p['data']['succ_hash'] = None
+        p['data']['succ_port'] = None
+        p['data']['pre_ip'] = data['ip']
+        p['data']['pre_hash'] =  data['ip_hash']
+        p['data']['pre_port'] = data['port']
+        send_packet(cache['succ_sock'],p)
+        with cache_lock:
+              cache['succ_ip'] = data['ip']
+              cache['succ_hash'] = data['ip_hash']
+              cache['succ_port'] = data['port']
+        close_peer_socket(cache['succ_sock'])
+
+    elif configs['my_ip_hash'] > data['ip_hash'] and cache['frontEnd']:
+            #insert in front of me
+            p['data']['for'] = data['ip']
+            p['data']['succ_ip'] = configs['my_ip']
+            p['data']['succ_hash'] = configs['my_ip_hash']
+            p['data']['succ_port'] = configs['my_port']
+            p['data']['pre_ip'] = cache['pre_ip']
+            p['data']['pre_hash'] =  cache['pre_hash']
+            p['data']['pre_port'] = cache['pre_port']
+            if configs['i_am_root']:
+                send_packet(cache['join_sock'],p)
+                close_peer_socket(cache['join_sock'])
+            else :
+                send_packet(cache['pre_sock'],p)
+            p['data']['for'] = cache['pre_ip']
+            p['data']['succ_ip'] = data['ip']
+            p['data']['succ_hash'] = data['ip_hash']
+            p['data']['succ_port'] = data['port']
+            p['data']['pre_ip'] = None
+            p['data']['pre_hash'] = None
+            p['data']['pre_port'] = None
+            send_packet(cache['pre_sock'],p)
+            with cache_lock:
+                cache['pre_ip'] = data['ip']
+                cache['pre_hash'] = data['ip_hash']
+                cache['pre_port'] = data['port']
+            close_peer_socket(cache['pre_sock'])
+
+    elif configs['my_ip_hash'] < data['ip_hash'] and cache['BackEnd']:
+            #insert behind me
+            p['data']['for'] = data['ip']
+            p['data']['succ_ip'] = cache['succ_ip']
+            p['data']['succ_hash'] = cache['succ_hash']
+            p['data']['succ_port'] = cache['succ_port']
+            p['data']['pre_ip'] = configs['my_ip']
+            p['data']['pre_hash'] = configs['my_ip_hash']
+            p['data']['pre_port'] = configs['my_port']
+            if configs['i_am_root']:
+                send_packet(cache['join_sock'],p)
+                close_peer_socket(cache['join_sock'])
+            else :
+                send_packet(cache['pre_sock'],p)
+            p['data']['for'] = cache['succ_ip']
+            p['data']['succ_ip'] = None
+            p['data']['succ_hash'] = None
+            p['data']['succ_port'] = None
+            p['data']['pre_ip'] = data['ip']
+            p['data']['pre_hash'] = data['ip_hash']
+            p['data']['pre_port'] = data['port']
+            send_packet(cache['succ_sock'],p)
+            with cache_lock:
+                cache['succ_ip'] = data['ip']
+                cache['succ_hash'] = data['ip_hash']
+                cache['succ_port'] = data['port']
+            close_peer_socket(cache['succ_sock'])
+    else:
+        #forward to join request to successor.
+        send_packet(cache['succ_sock'],data)
+
+    compute_end()
+
+# closes a peer socket in the right way.
+def close_peer_socket(conn):
+    global conn_list
+
+    if conn in conn_list:
+        conn_list.remove(conn)
+    conn.close()
+
+# moves all data that should belong to the new predecessor.
+def move_data(key):
+    global configs
+    global cache
+
+    p = {
+    "type" : "data",
+    "client_id": configs['my_ip_hash'],
+    "operation" : "move",
+    "obj_name" : "",
+    "obj_name_len" : 0,
+    "obj": "",
+    "obj_len" : 0,
+    "obj_key" : "",
+    }
+
+    try:
+        with open(configs['my_ip_hash'].encode('hex')+"_index.txt") as f:
+            data = f.read()
+    except:
+        # i dont have any data yet.
+        return
+    new_data = []
+    send_sock = None
+    for i in [i for i in data.split("\n") if i]:
+        f_name = configs['my_ip_hash'].encode('hex')+"_"
+
+        if configs['my_ip_hash'] < i.split(",")[0].decode('hex') <= cache['succ_hash'] and cache['succ_sock']:
+            send_sock = cache['succ_sock']
+
+        elif i.split(",")[0].decode('hex') <= cache['pre_hash'] and not cache['frontEnd'] and cache['pre_sock']:
+            send_sock = cache['pre_sock']
+
+
+        elif cache['pre_hash'] >= i.split(",")[0].decode('hex') > configs['my_ip_hash'] and cache['frontEnd'] and cache['pre_sock']:
+            send_sock = cache['pre_sock']
+
+        elif configs['my_ip_hash'] < i.split(",")[0].decode('hex') and cache['BackEnd'] and cache['succ_sock']:
+            send_sock = cache['succ_sock']
+
+        else:
+            new_data.append(i)
+            continue
+
+        f_name += i.split(",")[1]
+        p['obj_name'] = i.split(",")[1]
+        p['obj_name_len'] = len(i.split(",")[1])
+        p['obj_key'] = i.split(",")[0].decode('hex')
+
+        with open(f_name) as f:
+            obj = f.read()
+
+        p['obj'] = obj
+        p['obj_len'] = len(obj)
+        print "MOVING", p['obj_name'], "TO", cache['pre_ip']
+        send_packet(send_sock,p)
+        os.remove(f_name)
+
+    with open(configs['my_ip_hash'].encode('hex')+"_index.txt","w") as f:
+        f.write("\n".join(new_data)+"\n")
+
+# handles INIT packets sent through new connection sockets.
+def handle_init(data,conn):
+    global cache_lock
+    global cache
+
+    with cache_lock:
+        prev = cache[data['data']]
+        cache[data['data']] = conn
+
+    move_data(data['data'].split('_')[0])
+
+# handles new UPDATE messages.
+def update_handler(data,conn):
+    global conn_list
+    global configs
+
+    #is the update for me?
+    if data['data']['for'] == configs['my_ip']:
+        with cache_lock:
+            if data['data']['succ_ip'] and data['data']['succ_hash'] :
+                cache['succ_ip'] = data['data']['succ_ip']
+                cache['succ_hash'] = data['data']['succ_hash']
+                cache['succ_port'] = data['data']['succ_port']
+
+            if data['data']['pre_ip'] and data['data']['pre_hash'] :
+                cache['pre_ip'] = data['data']['pre_ip']
+                cache['pre_hash'] = data['data']['pre_hash']
+                cache['pre_port'] = data['data']['pre_port']
+
+        # i am the one that sent the join request.....
+        if data['data']['pre_ip'] and data['data']['pre_hash'] and data['data']['succ_ip'] and data['data']['succ_hash']:
+            cache['succ_sock'] = socket.socket(socket.AF_INET,socket.SOCK_STREAM)
+            cache['succ_sock'].connect((cache['succ_ip'],cache['succ_port']))
+            p = {
+                "type":"init",
+                "ip":configs['my_ip'],
+                "ip_hash": configs['my_ip_hash'],
+                "data":"pre_sock"
+             }
+            send_packet(cache['succ_sock'],p)
+            conn_list.append(cache['succ_sock'])
+
+            cache['pre_sock'] = socket.socket(socket.AF_INET,socket.SOCK_STREAM)
+            cache['pre_sock'].connect((cache['pre_ip'],cache['pre_port']))
+            p = {
+                "type":"init",
+                "ip":configs['my_ip'],
+                "ip_hash": configs['my_ip_hash'],
+                "data":"succ_sock"
+             }
+            send_packet(cache['pre_sock'],p)
+            conn_list.append(cache['pre_sock'])
+
+    elif configs['i_am_root'] :
+        send_packet(cache['join_sock'],data)
+        # i dont need the connection to the new guy anymore.
+        close_peer_socket(cache['join_sock'])
+
+    else:
+        #forward data to predecessor
+        send_packet(cache['pre_sock'],data)
+
+    compute_end()
+
+# generates ANSWER packets in response to QUESTION packets.
+def answer_query(data,conn):
+    key = data['data']
+    p = {
+      "type" : "answer",
+      "ip" : cache[key+"_ip"],
+      "ip_hash" : cache[key+"_hash"],
+      "data" : key
+    }
+    send_packet(conn,p)
+
+# stores the object into this peers index file
+def store_data(data):
+    global configs
+
+    if retrieve_data(data['obj_key'])[1] == "No Such Key":
+        with open(configs['my_ip_hash'].encode('hex')+"_index.txt","a+") as f:
+            f.write(data['obj_key'].encode('hex')+","+data['obj_name']+"\n")
+
+        with open(configs['my_ip_hash'].encode('hex')+"_"+data['obj_name'],"w") as f:
+            f.write(data['obj'])
+
+# retrieves objects from this peers index file
+def retrieve_data(key):
+    global configs
+    try:
+        with open(configs['my_ip_hash'].encode('hex')+"_index.txt") as f:
+            data = f.read()
+
+        for i in [i for i in data.split("\n") if i]:
+            if key.encode('hex') == i.split(",")[0]:
+                f_name = i.split(",")[1]
+                break
+
+        with open(configs['my_ip_hash'].encode('hex')+"_"+f_name) as f:
+            return (f_name,f.read())
+    except:
+        pass
+
+    return ("","No Such Key")
+
+# closes client sockets the right way.
+def close_client_sock(client_id):
+    global conn_list
+    global client_store
+
+    cs = client_store.pop(client_id)
+    conn_list.remove(cs)
+    cs.close()
+
+# handles new data packets
+def handle_data(data,conn):
+    global configs
+    global client_store
+
+    if configs['i_am_root'] and data['operation'] == "lookup" and data['method'] == 'R':
+        client_store[data['client_id']] = conn
+
+    if data['operation'] == "get":
+        p = {
+        "type" : "data",
+        "operation" : "response",
+        "client_id" : data['client_id'],
+        "obj_name_len" : 0,
+        "obj_name" : "",
+        "obj_key" : data['obj_key'],
+        "obj_len" : 0,
+        "obj" : ""
+        }
+        obj_name = retrieve_data(data['obj_key'])[0]
+        obj = retrieve_data(data['obj_key'])[1]
+
+        p['obj_name'] = obj_name
+        p['obj_name_len'] = len(obj_name)
+        p['obj_len'] = len(obj)
+        p['obj'] = obj
+
+        send_packet(conn,p)
+        close_peer_socket(conn)
+
+    elif data['operation'] == "put":
+        store_data(data)
+        p = {
+        "type" : "data",
+        "operation" : "close",
+        "client_id" : data['client_id']
+        }
+        send_packet(conn,p)
+        close_peer_socket(conn)
+
+    elif data['operation'] == "move":
+        store_data(data)
+
+
+    #this is for recursive implementation.
+    elif data['operation'] == "redirect":
+        if configs['i_am_root']:
+            send_packet(client_store[data['client_id']],data)
+            close_client_sock(data['client_id'])
+        else:
+            send_packet(cache['pre_sock'],data)
+
+    elif data['operation'] == "lookup":
+        p = {
+        "type" : "data",
+        "operation" : "redirect",
+        "client_id" : data['client_id'],
+        "ip" : None,
+        "port" : None
+        }
+
+        # I am the only node in the n/w I should have the data
+        if cache['pre_sock'] == None and cache['succ_sock'] == None:
+            if data['method'] == 'R':
+                p['ip'] = configs['my_ip']
+                p['port'] = configs['my_port']
+            send_packet(conn,p)
+            close_client_sock(data['client_id'])
+
+        elif (data['obj_key'] <= configs['my_ip_hash'] and (data['obj_key'] > cache['pre_hash'] or cache['frontEnd'])):
+            if data['method'] == 'R':
+                p['ip'] = configs['my_ip']
+                p['port'] = configs['my_port']
+            send_packet(conn,p)
+            # if root has the packet itself
+            if configs['i_am_root']:
+                close_client_sock(data['client_id'])
+        else:
+            # any data between the BackEnd and frontEnd must be retrieved by frontEnd
+            if cache['frontEnd'] and data['obj_key'] > cache['pre_hash']:
+                if data['method'] == 'R':
+                    p['ip'] = configs['my_ip']
+                    p['port'] = configs['my_port']
+                send_packet(conn,p)
+
+            elif data['method'] == "R":
+                send_packet(cache['succ_sock'],data)
+
+            elif data['method'] == "I":
+                p = {
+                "type" : "data",
+                "operation" : "redirect",
+                "client_id" : data['client_id'],
+                "ip" : cache['succ_ip'],
+                "port" : cache['succ_port']
+                }
+                send_packet(conn,p)
+                close_peer_socket(conn)
+
+# handles new message packets
+def handle_messages(p,conn):
+
+    if p['type'] == 'join':
+        join_handler(p,conn)
+        print_info()
+
+    elif p['type'] == 'query':
+        answer_query(p,conn)
+
+    elif p['type'] == 'update':
+        update_handler(p,conn)
+        print_info()
+
+
+    elif p['type'] == 'init':
+        handle_init(p,conn)
+
+
+    elif p['type'] == 'dead':
+        handle_dead_notification(p)
+        print_info()
+
+    elif p['type'] == 'data':
+        handle_data(p,conn)
+
+# generate QUERY packets to both the successor and predecessor peers
+def question():
+    global kill
+    global cache_lock
+    global configs
+
+    packet = {
+        "type" : "query",
+        "ip": configs['my_ip'],
+        "ip_hash":configs['my_ip_hash'],
+    }
+
+    while(not kill):
+        with cache_lock:
+            if cache['succ_sock'] :
+                try:
+                    packet['data'] = "pre"
+                    send_packet(cache['succ_sock'],packet)
+                except socket.error:
+                    # the socket was closed.
+                    cache['succ_sock'] = None
+                    cache['succ_ip'] = None
+                    cache['succ_port'] = None
+                    print "my succesor is dead !!!"
+                    dead_succesor_notification()
+                    print_info();
+
+            if cache['pre_sock'] :
+                try:
+                    packet['data'] = "succ"
+                    send_packet(cache['pre_sock'],packet)
+                except socket.error:
+                    # the socket was closed.
+                    cache['pre_sock'] = None
+                    cache['pre_ip'] = None
+                    cache['pre_port'] = None
+                    print "my predecessor is dead !!!"
+                    print_info();
+
+        time.sleep(configs['query_interval'])
+
+# send a JOIN packet to the root.
+def join_network():
+    global conn_list
+    global BUFFER_SIZE
+    global configs
+
+    s = socket.socket(socket.AF_INET,socket.SOCK_STREAM)
+    s.connect((configs['root_ip'],configs['root_port']))
+    conn_list.append(s)
+
+    p = {
+    "type" : "join",
+    "ip" : configs['my_ip'],
+    "ip_hash" : configs['my_ip_hash'],
+    "port" : configs['my_port']
+    }
+    send_packet(s,p)
+
+# create a new DEAD packet when this peers succesor dies.
+def dead_succesor_notification():
+    global configs
+
+    p = {
+        "type" : "dead",
+        "ip" : configs['my_ip'],
+        "ip_hash" : configs['my_ip_hash'],
+        "port" : configs['my_port'],
+        "data" : cache['succ_hash'],
+
+    }
+    try:
+        send_packet(cache['pre_sock'],p)
+    except:
+        # looks like i am sending to a closed socket.
+        pass
+
+# handle DEAD notification packet.
+def handle_dead_notification(data):
+    global conn_list
+    global configs
+
+    if cache["pre_hash"] == data['data']:
+        with cache_lock:
+            cache['pre_ip'] = data['ip']
+            cache['pre_hash'] = data['ip_hash']
+            cache['pre_port'] = data['port']
+
+            cache['pre_sock'] = socket.socket(socket.AF_INET,socket.SOCK_STREAM)
+            cache['pre_sock'].connect((cache['pre_ip'],cache['pre_port']))
+            conn_list.append(cache['pre_sock'])
+            p = {
+                "type":"init",
+                "ip":configs['my_ip'],
+                "ip_hash":configs['my_ip_hash'],
+                "data":"succ_sock"
+             }
+            send_packet(cache['pre_sock'],p)
+            p = {
+               "type": "update",
+               "ip": configs['my_ip'],
+               "ip_hash":configs['my_ip_hash'],
+               "data" : {
+                "for" : cache['pre_ip'],
+                 "succ_ip" :configs['my_ip'],
+                 "succ_hash" :configs['my_ip_hash'],
+                 "succ_port" : configs['my_port'],
+                 "pre_ip" : None,
+                 "pre_hash" : None,
+                 "pre_port" : None
+                 }
+             }
+            send_packet(cache['pre_sock'],p)
+
+    else:
+        send_packet(cache['pre_sock'],data)
+    compute_end()
+
+def handle_command_line_args(argv):
+    global configs
+
+    parser = argparse.ArgumentParser(add_help=False);
+    parser.add_argument('-m', action="store", required=True, dest="type", help='1 => root 0 => regular peer')
+    parser.add_argument('-p', action="store", required=True, dest="own_port", help='own port')
+    parser.add_argument('-h', action="store", required=True, dest="own_hostname", help='hostname')
+    parser.add_argument('-r', action="store",  dest="root_port", help='root port')
+    parser.add_argument('-R', action="store",  dest="root_hostname", help='root hostname')
+
+    temp = vars(parser.parse_args(argv))
+    configs['i_am_root'] = int(temp['type']) == 1
+    configs['my_port'] = int(temp['own_port'])
+    my_ip = socket.gethostbyname(temp['own_hostname'])
+    configs['my_ip'] = my_ip
+    configs['my_ip_hash'] = hashlib.sha1(my_ip).digest()
+    # generate predictable hash for testing DO NOT UNCOMMENT
+    #configs['my_ip_hash'] = bytes(bytearray([0]*19) + bytearray('{:02x}'.format(int(my_ip.split('.')[3])).decode('hex')))
+    configs['root_port'] = int(temp['own_port']) if configs['i_am_root'] else int(temp['root_port'])
+    configs['root_ip'] = my_ip if configs['i_am_root'] else socket.gethostbyname(temp['root_hostname'])
+
+def print_info():
+    global configs
+    os.system('clear')
+
+    print "="*50
+    print "peer running on ",configs['my_ip'],':',configs['my_port']
+    print "root status :",configs['i_am_root']
+    print "root info :",configs['root_ip'],':',configs['root_port']
+    print_status()
+
+def print_status():
+    global cache
+
+    print "="*50
+    print '\x1b[0;31m',"succesor    : ",cache['succ_ip'],':',cache['succ_port'],'\x1b[0m'
+    print '\x1b[0;31m',"predecessor : ",cache['pre_ip'],':',cache['pre_port'],'\x1b[0m'
+    print "="*50
+
+def main():
+    global kill
+    global conn_list
+    global confgs
+
+    handle_command_line_args(sys.argv[1:])
+    print_info()
+
+    # create a new server socket.
+    server_socket = socket.socket(socket.AF_INET,socket.SOCK_STREAM)
+    server_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    server_socket.bind((configs['my_ip'],configs['my_port']))
+    server_socket.listen(10)
+
+    conn_list.append(server_socket)
+
+    print "peer ready to recieve connections"
+    t = Thread(target=question,args=())
+    t.start()
+
+
+    if not configs['i_am_root']:
+        join_network()
+
+    try:
+        while True:
+            read_sockets, write_sockets, err_sockets = select.select(conn_list,[],[])
+            for s in read_sockets:
+                if s == server_socket :
+                    conn, addr = server_socket.accept()
+                    conn_list.append(conn)
+                    print "connection recieved from peer :",addr
+                else:
+                    try:
+                        data = recv_packet(s)
+                        handle_messages(data,s)
+                    # if the socket has errored or is closed remove it from monitoring
+                    except:
+                        close_peer_socket(s)
+    except:
+        print "  closing... max_latency :",configs['query_interval'],"seconds"
+        kill = True
+        t.join()
+        server_socket.close()
+        for s in conn_list:
+            s.close()
+        print "cleanup complete!!  EXIT"
+
+if __name__ == "__main__":
+    main()
